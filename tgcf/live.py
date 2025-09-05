@@ -1,165 +1,267 @@
-"""The module responsible for operating tgcf in live mode."""
+# tgcf/live.py
+#
+# Live forwarder/copy con soporte de ÁLBUMES (media groups).
+# - Usa Telethon events.Album para recibir grupos y los reenvía/copía como álbum.
+# - Separa por tipo (foto/video/doc) porque Telegram no permite mezclar tipos en un mismo grupo.
+# - En copy: client.send_file(..., files=[...]) crea el media group (2–10 ítems). Se trocea en bloques de 10.
+# - En forward: event.forward_to(dest) preserva el álbum si el origen lo permite (contenido no protegido).
+#
+# Configuración:
+#   - TGCF_CONFIG   (opcional) ruta del JSON de config; por defecto: ./tgcf.config.json
+#   - TGCF_SESSION  (opcional) string session; si no, usa archivo ./tgcf.session
+#   - API_ID / API_HASH (si te autenticas por primera vez o renuevas sesión)
+#
+# JSON esperado (mínimo):
+# {
+#   "mode": "live",
+#   "copy": true,
+#   "forward": false,
+#   "from_to": { "@origen": ["@staging"] }
+# }
+#
+# Logs clave:
+#   - "Listening sources: [...]"
+#   - "ALBUM recibido: src=... gid=... items=..."
+#   - "ALBUM enviado: src=... -> dest=... kind=... count=..."
+#   - En singles: "Skip single of album gid=..." evita duplicados
+#   - Errores con trace completo (fallback a ítems sueltos en álbumes)
+#
+from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import sys
-from typing import Union
+from dataclasses import dataclass
+from typing import Dict, List, Union, Optional
 
-from telethon import TelegramClient, events, functions, types
+from telethon import events
+from telethon.tl.types import Message
 from telethon.sessions import StringSession
-from telethon.tl.custom.message import Message
+from telethon.sync import TelegramClient
 
-from tgcf import config, const
-from tgcf import storage as st
-from tgcf.bot import get_events
-from tgcf.config import CONFIG, get_SESSION
-from tgcf.plugins import apply_plugins, load_async_plugins
-from tgcf.utils import clean_session_files, send_message
+# --------------------------------
+# Logging
+# --------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("tgcf.live")
+logging.getLogger("telethon").setLevel(logging.INFO)
 
+# --------------------------------
+# Config
+# --------------------------------
+@dataclass
+class LiveConfig:
+    copy: bool = True          # copiar (re-subir) en lugar de forward
+    forward: bool = False      # forward nativo (mantiene origen si se permite)
+    from_to: Dict[str, List[str]] = None
 
-async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
-    """Process new incoming messages."""
-    chat_id = event.chat_id
-
-    if chat_id not in config.from_to:
-        return
-    logging.info(f"New message received in {chat_id}")
-    message = event.message
-
-    event_uid = st.EventUid(event)
-
-    length = len(st.stored)
-    exceeding = length - const.KEEP_LAST_MANY
-
-    if exceeding > 0:
-        for key in st.stored:
-            del st.stored[key]
-            break
-
-    dest = config.from_to.get(chat_id)
-
-    tm = await apply_plugins(message)
-    if not tm:
-        return
-
-    if event.is_reply:
-        r_event = st.DummyEvent(chat_id, event.reply_to_msg_id)
-        r_event_uid = st.EventUid(r_event)
-
-    st.stored[event_uid] = {}
-    for d in dest:
-        if event.is_reply and r_event_uid in st.stored:
-            tm.reply_to = st.stored.get(r_event_uid).get(d)
-        fwded_msg = await send_message(d, tm)
-        st.stored[event_uid].update({d: fwded_msg})
-    tm.clear()
-
-
-async def edited_message_handler(event) -> None:
-    """Handle message edits."""
-    message = event.message
-
-    chat_id = event.chat_id
-
-    if chat_id not in config.from_to:
-        return
-
-    logging.info(f"Message edited in {chat_id}")
-
-    event_uid = st.EventUid(event)
-
-    tm = await apply_plugins(message)
-
-    if not tm:
-        return
-
-    fwded_msgs = st.stored.get(event_uid)
-
-    if fwded_msgs:
-        for _, msg in fwded_msgs.items():
-            if config.CONFIG.live.delete_on_edit == message.text:
-                await msg.delete()
-                await message.delete()
-            else:
-                await msg.edit(tm.text)
-        return
-
-    dest = config.from_to.get(chat_id)
-
-    for d in dest:
-        await send_message(d, tm)
-    tm.clear()
-
-
-async def deleted_message_handler(event):
-    """Handle message deletes."""
-    chat_id = event.chat_id
-    if chat_id not in config.from_to:
-        return
-
-    logging.info(f"Message deleted in {chat_id}")
-
-    event_uid = st.EventUid(event)
-    fwded_msgs = st.stored.get(event_uid)
-    if fwded_msgs:
-        for _, msg in fwded_msgs.items():
-            await msg.delete()
-        return
-
-
-ALL_EVENTS = {
-    "new": (new_message_handler, events.NewMessage()),
-    "edited": (edited_message_handler, events.MessageEdited()),
-    "deleted": (deleted_message_handler, events.MessageDeleted()),
-}
-
-
-async def start_sync() -> None:
-    """Start tgcf live sync."""
-    # clear past session files
-    clean_session_files()
-
-    # load async plugins defined in plugin_models
-    await load_async_plugins()
-
-    SESSION = get_SESSION()
-    client = TelegramClient(
-        SESSION,
-        CONFIG.login.API_ID,
-        CONFIG.login.API_HASH,
-        sequential_updates=CONFIG.live.sequential_updates,
+def _load_config(path: str) -> LiveConfig:
+    if not os.path.exists(path):
+        log.error("No encuentro config en %s", path)
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return LiveConfig(
+        copy=bool(data.get("copy", True)),
+        forward=bool(data.get("forward", False)),
+        from_to=data.get("from_to", {}) or {},
     )
-    if CONFIG.login.user_type == 0:
-        if CONFIG.login.BOT_TOKEN == "":
-            logging.warning("Bot token not found, but login type is set to bot.")
-            sys.exit()
-        await client.start(bot_token=CONFIG.login.BOT_TOKEN)
-    else:
-        await client.start()
-    config.is_bot = await client.is_bot()
-    logging.info(f"config.is_bot={config.is_bot}")
-    command_events = get_events()
 
-    await config.load_admins(client)
+TGCF_CONFIG = os.getenv("TGCF_CONFIG", "tgcf.config.json")
+config = _load_config(TGCF_CONFIG)
 
-    ALL_EVENTS.update(command_events)
+# --------------------------------
+# Session / Client
+# --------------------------------
+API_ID = int(os.getenv("API_ID", "0") or "0")
+API_HASH = os.getenv("API_HASH")
+SESSION_STR = os.getenv("TGCF_SESSION")  # si está presente, usamos string session
+SESSION_FILE = os.getenv("TGCF_SESSION_FILE", "tgcf.session")
 
-    for key, val in ALL_EVENTS.items():
-        if config.CONFIG.live.delete_sync is False and key == "deleted":
-            continue
-        client.add_event_handler(*val)
-        logging.info(f"Added event handler for {key}")
+def _make_client() -> TelegramClient:
+    if SESSION_STR:
+        if not API_ID or not API_HASH:
+            log.error("Necesitas API_ID y API_HASH para usar TGCF_SESSION")
+            sys.exit(1)
+        log.info("Usando TGCF_SESSION (string session)")
+        return TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    # archivo de sesión
+    if API_ID and API_HASH:
+        log.info("Usando archivo de sesión %s", SESSION_FILE)
+        return TelegramClient(SESSION_FILE, API_ID, API_HASH)
+    # Si no hay API_ID/Hash, igual ya existe el archivo de sesión con credenciales guardadas
+    log.info("Intentando abrir sesión existente en %s (sin API_ID/API_HASH)", SESSION_FILE)
+    return TelegramClient(SESSION_FILE, API_ID or 0, API_HASH or "")
 
-    if config.is_bot and const.REGISTER_COMMANDS:
-        await client(
-            functions.bots.SetBotCommandsRequest(
-                scope=types.BotCommandScopeDefault(),
-                lang_code="en",
-                commands=[
-                    types.BotCommand(command=key, description=value)
-                    for key, value in const.COMMANDS.items()
-                ],
-            )
+client = _make_client()
+
+# --------------------------------
+# Resolución de chats (@username / -100id) a IDs numéricos
+# --------------------------------
+async def _resolve_chat_id(identifier: str) -> int:
+    """
+    Acepta @username, t.me/..., o -100xxxxxxxxxx y devuelve chat_id numérico.
+    """
+    identifier = identifier.strip()
+    if identifier.startswith("t.me/") or identifier.startswith("https://t.me/"):
+        # Telethon acepta directamente el URL también
+        ent = await client.get_entity(identifier)
+        return int(getattr(ent, "id"))
+    if identifier.startswith("-100") or identifier.lstrip("-").isdigit():
+        return int(identifier)
+    if identifier.startswith("@"):
+        ent = await client.get_entity(identifier)
+        return int(getattr(ent, "id"))
+    # fallback: intenta como nombre/username
+    ent = await client.get_entity(identifier)
+    return int(getattr(ent, "id"))
+
+async def _resolve_from_to(from_to_conf: Dict[str, List[str]]) -> Dict[int, List[int]]:
+    out: Dict[int, List[int]] = {}
+    for src, dests in from_to_conf.items():
+        src_id = await _resolve_chat_id(src)
+        out[src_id] = []
+        for d in dests:
+            out[src_id].append(await _resolve_chat_id(d))
+    return out
+
+# --------------------------------
+# Utilidades de envío
+# --------------------------------
+def _bucket_kind(m: Message) -> str:
+    # Telegram no permite mezclar arbitrariamente tipos en un mismo media group
+    if getattr(m, "photo", None):
+        return "photo"
+    mt = (getattr(getattr(m, "document", None), "mime_type", "") or "")
+    return "video" if mt.startswith("video/") else "doc"
+
+async def _send_single(dest: int, msg: Message, *, copy: bool):
+    """
+    Envía un mensaje suelto. Si copy=True, re-sube; si False, forward.
+    """
+    if copy:
+        await client.send_message(
+            dest,
+            message=msg.message or "",
+            file=getattr(msg, "media", None),
+            link_preview=getattr(msg, "media", None) is None,  # previsualiza links si es solo texto
         )
-    config.from_to = await config.load_from_to(client, config.CONFIG.forwards)
+    else:
+        await client.forward_messages(dest, msg.id, msg.chat_id)
+
+async def _send_album_copy(dest: int, items: List[Message], caption: Optional[str]):
+    """
+    Envía un álbum (copy) troceando a 10 y separando por tipo.
+    """
+    # bucket por tipo
+    buckets: Dict[str, List[Message]] = {}
+    for m in items:
+        if getattr(m, "media", None):
+            buckets.setdefault(_bucket_kind(m), []).append(m)
+
+    for kind, bucket in buckets.items():
+        files = [m.media for m in bucket if getattr(m, "media", None)]
+        if not files:
+            continue
+        cap = caption
+        i = 0
+        while i < len(files):
+            part = files[i : i + 10]  # Telegram: 2–10 ítems por media group
+            await client.send_file(dest, part, caption=cap, supports_streaming=True)
+            cap = None  # caption solo en el primer grupo
+            i += 10
+
+# --------------------------------
+# === Handlers ===
+# --------------------------------
+def attach_handlers(from_to_ids: Dict[int, List[int]], copy_mode: bool, forward_mode: bool):
+    """
+    Registra handlers para singles y álbumes.
+    """
+    src_ids = list(from_to_ids.keys())
+    log.info("Listening sources: %s", src_ids)
+
+    @client.on(events.NewMessage(chats=src_ids))
+    async def on_new_message(event: events.NewMessage.Event):
+        chat = event.chat_id
+        msg: Message = event.message
+
+        # Evita duplicados: si pertenece a un álbum, lo gestionará `on_album`
+        if getattr(msg, "grouped_id", None):
+            log.debug("Skip single of album gid=%s mid=%s", msg.grouped_id, msg.id)
+            return
+
+        dests = from_to_ids.get(chat, [])
+        if not dests:
+            return
+
+        for d in dests:
+            try:
+                await _send_single(d, msg, copy=copy_mode and not forward_mode)
+                log.info("SINGLE enviado: from %s -> %s mid=%s", chat, d, msg.id)
+            except Exception as e:
+                log.exception("Fallo enviando SINGLE from=%s to=%s mid=%s: %s", chat, d, msg.id, e)
+
+    @client.on(events.Album(chats=src_ids))
+    async def on_album(event: events.Album.Event):
+        src = event.chat_id
+        items: List[Message] = list(event.messages)
+        gid = getattr(event, "grouped_id", None)
+        caption = next((m.message for m in items if m.message), None)
+        dests = from_to_ids.get(src, [])
+
+        log.info("ALBUM recibido: src=%s gid=%s items=%d dests=%s", src, gid, len(items), dests)
+
+        if not dests:
+            return
+
+        for d in dests:
+            try:
+                if forward_mode and not copy_mode:
+                    # forward del álbum completo (si el origen lo permite)
+                    await event.forward_to(d)
+                    log.info("ALBUM reenviado (forward): src=%s -> dest=%s gid=%s items=%d", src, d, gid, len(items))
+                else:
+                    # copy: reconstruye álbum con send_file(files=[...])
+                    await _send_album_copy(d, items, caption)
+                    log.info("ALBUM enviado (copy): src=%s -> dest=%s gid=%s items=%d", src, d, gid, len(items))
+            except Exception as e:
+                log.exception("Fallo enviando ALBUM src=%s dest=%s gid=%s: %s", src, d, gid, e)
+                # Fallback: no pierdas contenido
+                cap = caption
+                for idx, m in enumerate(items):
+                    try:
+                        await client.send_file(d, getattr(m, "media", None), caption=cap if idx == 0 else None, supports_streaming=True)
+                    except Exception:
+                        log.exception("Fallo enviando ítem suelto del álbum (src=%s dest=%s mid=%s)", src, d, getattr(m, "id", None))
+                    cap = None
+
+# --------------------------------
+# Main (modo live)
+# --------------------------------
+async def main():
+    await client.connect()
+    if not await client.is_user_authorized():
+        # Solo si no hay sesión previa; te pedirá login si API_ID/HASH están
+        log.warning("Sesión no autorizada. Iniciando flujo de login...")
+        await client.send_code_request("ME")  # placeholder; normalmente usas número de teléfono
+        # En App Platform, lo normal es traer una string session ya autorizada.
+
+    # Resuelve mapping de @usernames/IDs a IDs numéricos
+    from_to_ids = await _resolve_from_to(config.from_to)
+    attach_handlers(from_to_ids, copy_mode=config.copy, forward_mode=config.forward)
+
+    log.info("Live mode listo. Esperando eventos…")
     await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
